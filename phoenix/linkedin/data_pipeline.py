@@ -528,6 +528,11 @@ class LinkedInBatchAssembler:
 
 
 if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
     dsn = os.environ.get("LINKEDIN_DB_DSN")
     if not dsn:
         print("SKIP: LINKEDIN_DB_DSN not set")

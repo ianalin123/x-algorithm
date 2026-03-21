@@ -377,6 +377,11 @@ def train(
 
 
 if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
     parser = argparse.ArgumentParser(description="Train LinkedIn Phoenix model")
     parser.add_argument("--dsn", type=str, default=None)
     parser.add_argument("--max-steps", type=int, default=1000)
