@@ -166,4 +166,8 @@ def score(post, post_file, post_type, author_urn, icp, max_audience, checkpoint_
 
 
 if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     cli()
