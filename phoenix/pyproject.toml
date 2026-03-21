@@ -42,6 +42,9 @@ ignore = [
 ]
 select = ["ISC001"]
 
+[tool.pytest.ini_options]
+testpaths = ["linkedin/tests"]
+
 [dependency-groups]
 dev = [
     "pytest",
