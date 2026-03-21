@@ -50,7 +50,14 @@ class LinkedInDataLoader:
         if limit:
             query += f" LIMIT {int(limit)}"
 
-        return pd.read_sql_query(query, conn)
+        df = pd.read_sql_query(query, conn, parse_dates=["posted_at"])
+        if (
+            "posted_at" in df.columns
+            and hasattr(df["posted_at"].dtype, "tz")
+            and df["posted_at"].dtype.tz is not None
+        ):
+            df["posted_at"] = df["posted_at"].dt.tz_localize(None)
+        return df
 
     def load_profiles(self, limit: Optional[int] = None) -> pd.DataFrame:
         """Load linkedin_profiles table."""
@@ -84,7 +91,14 @@ class LinkedInDataLoader:
         if limit:
             query += f" LIMIT {int(limit)}"
 
-        return pd.read_sql_query(query, conn, parse_dates=["reacted_at"])
+        df = pd.read_sql_query(query, conn, parse_dates=["reacted_at"])
+        if (
+            "reacted_at" in df.columns
+            and hasattr(df["reacted_at"].dtype, "tz")
+            and df["reacted_at"].dtype.tz is not None
+        ):
+            df["reacted_at"] = df["reacted_at"].dt.tz_localize(None)
+        return df
 
     def get_temporal_split(
         self,
@@ -248,6 +262,14 @@ class NegativeSampler:
         self.negative_ratio = negative_ratio
         self.rng = np.random.default_rng(seed)
 
+    @staticmethod
+    def _to_naive_utc(ts):
+        if hasattr(ts, "tz") and ts.tz is not None:
+            return ts.tz_localize(None)
+        if hasattr(ts, "tzinfo") and ts.tzinfo is not None:
+            return ts.replace(tzinfo=None)
+        return ts
+
     def sample_negatives(
         self,
         user_urn: str,
@@ -257,12 +279,17 @@ class NegativeSampler:
         user_positive_urns: set[str],
     ) -> list[str]:
         del user_urn
-        window_start = positive_timestamp - pd.Timedelta(days=self.window_days)
-        window_end = positive_timestamp + pd.Timedelta(days=self.window_days)
+        ts = self._to_naive_utc(positive_timestamp)
+        window_start = ts - pd.Timedelta(days=self.window_days)
+        window_end = ts + pd.Timedelta(days=self.window_days)
+
+        posted_at = all_posts_df["posted_at"]
+        if hasattr(posted_at.dtype, "tz") and posted_at.dtype.tz is not None:
+            posted_at = posted_at.dt.tz_localize(None)
 
         mask = (
-            (all_posts_df["posted_at"] >= window_start)
-            & (all_posts_df["posted_at"] <= window_end)
+            (posted_at >= window_start)
+            & (posted_at <= window_end)
             & (~all_posts_df["provider_urn"].isin(list(user_positive_urns)))
             & (all_posts_df["provider_urn"] != positive_post_urn)
         )
