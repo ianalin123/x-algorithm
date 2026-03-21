@@ -28,6 +28,9 @@ class LinkedInDataLoader:
     def _get_connection(self):
         if self._conn is None or self._conn.closed:
             self._conn = psycopg2.connect(self.dsn)
+            with self._conn.cursor() as cur:
+                cur.execute("SET statement_timeout = '300s'")
+            self._conn.commit()
         return self._conn
 
     def load_posts(self, limit: Optional[int] = None) -> pd.DataFrame:
@@ -45,7 +48,6 @@ class LinkedInDataLoader:
                 like_reactions, support_reactions, love_reactions,
                 insight_reactions, celebrate_reactions, funny_reactions
             FROM linkedin_posts
-            ORDER BY posted_at DESC
         """
         if limit:
             query += f" LIMIT {int(limit)}"
@@ -86,7 +88,6 @@ class LinkedInDataLoader:
                 provider_profile_urn, provider_post_urn,
                 type, reacted_at
             FROM linkedin_reactions
-            ORDER BY reacted_at ASC
         """
         if limit:
             query += f" LIMIT {int(limit)}"
