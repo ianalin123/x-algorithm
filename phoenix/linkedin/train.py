@@ -282,9 +282,11 @@ def train(
 
     has_db = dsn or os.environ.get("LINKEDIN_DB_DSN")
     assembler = None
-    histories = None
+    train_indices = None
+    val_indices = None
     training_pairs = None
     posts = None
+    histories = None
 
     if has_db:
         logger.info("Loading real data from DB")
@@ -297,18 +299,59 @@ def train(
 
         loader = LinkedInDataLoader(dsn=dsn)
         reactions = loader.load_reactions(limit=data_subset)
-        posts = loader.load_posts(limit=data_subset)
+        posts = loader.load_posts(limit=data_subset * 10 if data_subset else None)
+
+        # Drop reactions with null timestamps (can't do temporal split without them)
+        before_count = len(reactions)
+        reactions = reactions.dropna(subset=["reacted_at"]).reset_index(drop=True)
+        if before_count != len(reactions):
+            logger.info(f"Dropped {before_count - len(reactions)} reactions with null reacted_at")
+
+        reactions = reactions.sort_values("reacted_at").reset_index(drop=True)
+        split_idx = int(len(reactions) * 0.8)
+        train_reactions = reactions.iloc[:split_idx]
+        val_reactions = reactions.iloc[split_idx:]
+        logger.info(
+            f"Temporal split: {len(train_reactions)} train reactions, "
+            f"{len(val_reactions)} val reactions"
+        )
+
+        # Build histories from TRAIN reactions only (no data leakage)
         builder = UserHistoryBuilder(max_history_len=config.history_seq_len)
-        histories = builder.build_histories(reactions, posts)
+        histories = builder.build_histories(train_reactions, posts)
+        stats = builder.get_density_stats(histories)
+        logger.info(
+            f"Users: {stats['total_users']} "
+            f"(sparse<10: {stats['sparse_lt10']}, "
+            f"medium: {stats['medium_10_30']}, "
+            f"dense30+: {stats['dense_30_plus']})"
+        )
+
+        # Build training pairs from TRAIN reactions, val pairs from VAL reactions
         sampler = NegativeSampler(negative_ratio=5)
-        training_pairs = sampler.build_training_pairs(reactions, posts)
+        training_pairs = sampler.build_training_pairs(train_reactions, posts)
+        val_pairs = sampler.build_training_pairs(val_reactions, posts)
+        logger.info(f"Training pairs: {len(training_pairs)}, Val pairs: {len(val_pairs)}")
+
         assembler = LinkedInBatchAssembler(config)
-        logger.info(f"Training pairs: {len(training_pairs)}, Users: {len(histories)}")
+
+        # Pre-build val batches (small enough to hold in memory)
+        n_val_batches = min(20, len(val_pairs) // batch_size)
+        val_batches = []
+        for i in range(n_val_batches):
+            start = i * batch_size
+            end = min(start + batch_size, len(val_pairs))
+            vb = assembler.assemble_batch(val_pairs, histories, posts, list(range(start, end)))
+            val_batches.append(_batch_to_jax(vb))
+        logger.info(f"Pre-built {len(val_batches)} val batches")
     else:
         logger.info("No DB — using synthetic data")
+        val_batches = []
 
-    best_loss = float("inf")
+    best_val_loss = float("inf")
     patience_counter = 0
+    step_num = 0
+    loss_val = 0.0
 
     for step_num in range(max_steps):
         rng, step_rng = jax.random.split(rng)
@@ -323,51 +366,150 @@ def train(
         params, opt_state, loss, logits = _call_step(
             step_fn, params, opt_state, step_rng, batch_jax, emb_jax, labels_jax
         )
-        loss_val = float(loss)
+        train_loss = float(loss)
 
         if step_num % 10 == 0:
-            print(f"step {step_num}: loss={loss_val:.4f}")
+            print(f"step {step_num}: train_loss={train_loss:.4f}")
             if use_wandb:
                 import wandb
 
-                wandb.log({"train/loss": loss_val, "train/step": step_num})
+                wandb.log({"train/loss": train_loss, "train/step": step_num})
 
-        if step_num % eval_every_n_steps == 0 and step_num > 0:
-            if loss_val < best_loss:
-                best_loss = loss_val
+        # Validation evaluation
+        if step_num % eval_every_n_steps == 0 and step_num > 0 and val_batches:
+            val_losses = []
+            all_val_preds = []
+            all_val_labels = []
+
+            for vb_jax, ve_jax, vl_jax in val_batches:
+                from linkedin.loss import linkedin_hybrid_loss
+                from recsys_model import RecsysEmbeddings
+
+                output = forward_fn.apply(
+                    params,
+                    rng,
+                    vb_jax,
+                    RecsysEmbeddings(
+                        user_embeddings=ve_jax.user_embeddings,
+                        history_post_embeddings=ve_jax.history_post_embeddings,
+                        candidate_post_embeddings=ve_jax.candidate_post_embeddings,
+                        history_author_embeddings=ve_jax.history_author_embeddings,
+                        candidate_author_embeddings=ve_jax.candidate_author_embeddings,
+                    ),
+                )
+                vl = float(linkedin_hybrid_loss(output.logits, vl_jax))
+                val_losses.append(vl)
+
+                from linkedin.loss import compute_action_probs
+
+                probs = np.array(compute_action_probs(output.logits))
+                all_val_preds.append(probs.reshape(-1, 8))
+                reaction_flat = np.array(vl_jax.reaction_labels).reshape(-1, 6)
+                comment_flat = np.array(vl_jax.comment_label).reshape(-1, 1)
+                repost_flat = np.array(vl_jax.repost_label).reshape(-1, 1)
+                all_val_labels.append(
+                    np.concatenate([reaction_flat, comment_flat, repost_flat], axis=1)
+                )
+
+            avg_val_loss = float(np.mean(val_losses))
+
+            # Compute per-action AUC-ROC
+            from linkedin.config import LINKEDIN_ACTIONS
+
+            preds_all = np.array(np.concatenate(all_val_preds, axis=0), dtype=np.float32)
+            labels_all = np.array(np.concatenate(all_val_labels, axis=0), dtype=np.float32)
+            auc_str = ""
+            for i, action in enumerate(LINKEDIN_ACTIONS):
+                col_labels = (
+                    labels_all[:, i] if i < labels_all.shape[1] else np.zeros(len(labels_all))
+                )
+                col_preds = preds_all[:, i]
+                col_labels = np.array(col_labels, dtype=np.float32)
+                col_preds = np.array(col_preds, dtype=np.float32)
+                col_labels_bin = (col_labels > 0.5).astype(np.float32)
+                unique = np.unique(col_labels_bin)
+                if len(unique) >= 2:
+                    from sklearn.metrics import roc_auc_score
+
+                    auc = roc_auc_score(col_labels_bin, col_preds)
+                    auc_str += f" {action[:4]}={auc:.3f}"
+                else:
+                    auc_str += f" {action[:4]}=n/a"
+
+            gap = train_loss - avg_val_loss
+            overfit_flag = " ⚠️ OVERFITTING" if train_loss < avg_val_loss * 0.5 else ""
+            print(
+                f"  [EVAL step {step_num}] "
+                f"train={train_loss:.4f} val={avg_val_loss:.4f} "
+                f"gap={gap:+.4f}{overfit_flag}"
+            )
+            print(f"  [AUC-ROC]{auc_str}")
+            logger.info(
+                f"Val loss: {avg_val_loss:.4f} (train: {train_loss:.4f}, "
+                f"gap: {gap:+.4f}){overfit_flag}"
+            )
+
+            if use_wandb:
+                import wandb
+
+                wandb.log(
+                    {
+                        "val/loss": avg_val_loss,
+                        "val/train_val_gap": gap,
+                        "val/patience": patience_counter,
+                    }
+                )
+
+            # Early stopping on VAL loss (not train loss)
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
                 patience_counter = 0
                 save_checkpoint(
                     params,
                     opt_state,
                     step_num,
-                    {"best_loss": best_loss},
+                    {"best_val_loss": best_val_loss, "train_loss": train_loss},
                     checkpoint_dir,
                 )
-                logger.info(f"New best loss: {best_loss:.4f}")
+                logger.info(f"New best val loss: {best_val_loss:.4f}")
             else:
                 patience_counter += 1
 
-            if use_wandb:
-                import wandb
-
-                wandb.log({"val/best_loss": best_loss, "val/patience": patience_counter})
-
             if patience_counter >= early_stopping_patience:
                 logger.info(
-                    f"Early stopping at step {step_num} (patience={early_stopping_patience})"
+                    f"Early stopping at step {step_num} "
+                    f"(val loss not improving, patience={early_stopping_patience})"
                 )
                 break
 
+        elif step_num % eval_every_n_steps == 0 and step_num > 0 and not val_batches:
+            # No val data — fall back to train loss (synthetic mode)
+            if train_loss < best_val_loss:
+                best_val_loss = train_loss
+                patience_counter = 0
+                save_checkpoint(
+                    params,
+                    opt_state,
+                    step_num,
+                    {"best_loss": best_val_loss},
+                    checkpoint_dir,
+                )
+            else:
+                patience_counter += 1
+            if patience_counter >= early_stopping_patience:
+                break
+
+    loss_val = train_loss
     save_checkpoint(
         params,
         opt_state,
         step_num,
-        {"final_loss": loss_val, "best_loss": best_loss},
+        {"final_train_loss": train_loss, "best_val_loss": best_val_loss},
         checkpoint_dir,
     )
     print(
-        f"Training complete. Steps: {step_num + 1}, "
-        f"Final loss: {loss_val:.4f}, Best loss: {best_loss:.4f}"
+        f"\nTraining complete. Steps: {step_num + 1}, "
+        f"Final train loss: {train_loss:.4f}, Best val loss: {best_val_loss:.4f}"
     )
 
     if use_wandb:
